@@ -1,0 +1,103 @@
+services:
+  # === Vocalis Backend (FastAPI) ===
+  vocalis-backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    container_name: vocalis-backend
+    environment:
+      # LLM endpoint (llama.cpp server)
+      LLM_API_ENDPOINT: http://llm-server:8080/v1/chat/completions
+      # TTS endpoint (Kokoro TTS service)
+      TTS_API_ENDPOINT: http://tts-server:8880/v1/audio/speech
+      TTS_VOICE: af_sky
+      # Whisper model for ASR (runs locally in the container)
+      WHISPER_MODEL: tiny.en
+      # Server config
+      WEBSOCKET_HOST: 0.0.0.0
+      WEBSOCKET_PORT: 8000
+      # Optional: VAD settings
+      VAD_THRESHOLD: "0.5"
+      VAD_BUFFER_SIZE: "30"
+      AUDIO_SAMPLE_RATE: "48000"
+    depends_on:
+      - llm-server
+      - tts-server
+    ports:
+      - "8000:8000"
+    # Optional: mount for model cache if needed
+    volumes:
+      - whisper-cache:/root/.cache/huggingface
+    networks:
+      - vocalis-net
+    restart: unless-stopped
+
+  # === Vocalis Frontend (React + Vite) ===
+  vocalis-frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    container_name: vocalis-frontend
+    depends_on:
+      - vocalis-backend
+    ports:
+      - "3000:80"
+    networks:
+      - vocalis-net
+    restart: unless-stopped
+
+  # === LLM: llama.cpp server (GPU) ===
+  llm-server:
+    image: ghcr.io/ggerganov/llama.cpp:server-cuda
+    container_name: llm-server
+    command: >
+      --model /models/blobs/sha256-6a0746a1ec1aef3e7ec53868f220ff6e389f6f8ef87a01d77c96807de94ca2aa
+      --host 0.0.0.0
+      --port 8080
+      --ctx-size 4096
+      --n-gpu-layers 33
+    volumes:
+      - /mnt/LLM/gguf:/models:ro
+    ports:
+      - "8080:8080"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: ["gpu"]
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    networks:
+      - vocalis-net
+    restart: unless-stopped
+
+  # === TTS: Kokoro-FastAPI (official self-hosted TTS) ===
+  tts-server:
+    image: ghcr.io/remsky/kokoro-fastapi-gpu:v0.2.4
+    container_name: tts-server
+    volumes:
+      - /mnt/LLM/cache:/root/.cache
+    ports:
+      - "8880:8880"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: ["gpu"]
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    networks:
+      - vocalis-net
+    restart: unless-stopped
+
+volumes:
+  whisper-cache:
+    driver: local
+  tts-models:
+    driver: local
+
+networks:
+  vocalis-net:
+    driver: bridge
