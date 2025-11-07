@@ -4,7 +4,7 @@
  * Handles audio recording, processing, and playback
  */
 
-import websocketService, { WebSocketService, MessageType } from './websocket';
+import websocketService, {WebSocketService} from './websocket';
 
 // Audio configuration
 interface AudioConfig {
@@ -18,7 +18,7 @@ interface AudioConfig {
 
 // Default audio configuration
 const DEFAULT_CONFIG: AudioConfig = {
-  sampleRate: 44100, // Match microphone's native sample rate
+  sampleRate: 16000, // Match sherpa-asr expected sample rate
   channelCount: 1, // Mono
   echoCancellation: true,
   noiseSuppression: true,
@@ -59,9 +59,6 @@ export class AudioService {
   private mediaStream: MediaStream | null = null;
   private mediaStreamSource: MediaStreamAudioSourceNode | null = null;
   private scriptProcessor: ScriptProcessorNode | null = null;
-  private recordingIntervalId: number | null = null;
-  private recordingInterval: number = 100; // ms
-  private audioBuffer: Float32Array[] = [];
   private audioState: AudioState = AudioState.INACTIVE;
   private eventListeners: Map<AudioEvent, AudioEventListener[]> = new Map();
   private audioQueue: AudioBuffer[] = [];
@@ -69,47 +66,32 @@ export class AudioService {
   private isSpeaking: boolean = false; // Distinct from isPlaying to track TTS specifically
   private isMuted: boolean = false; // Track microphone mute state
   private currentSource: AudioBufferSourceNode | null = null;
-  
-  // State tracking (for UI coordination)
-  private isProcessing: boolean = false;
-  private isGreeting: boolean = false;
-  private isVisionProcessing: boolean = false;
-  
-  // Voice detection parameters
-  private isVoiceDetected: boolean = false;
-  private voiceThreshold: number = 0.01; // Adjust based on testing
-  private silenceTimeout: number = 1000; // ms to keep recording after voice drops below threshold
-  private lastVoiceTime: number = 0;
-  private minRecordingLength: number = 1000; // Minimum ms of audio to send
 
   constructor(config: Partial<AudioConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
   }
 
   /**
-   * Set processing state from UI
+   * Set processing state from UI (deprecated in Vocalis 2.0)
+   * These methods are kept for API compatibility but are no longer used
+   * since all processing state is now managed by the backend.
    */
-  public setProcessingState(isProcessing: boolean): void {
-    this.isProcessing = isProcessing;
-    console.log(`Processing state set to: ${isProcessing}`);
+  public setProcessingState(_isProcessing: boolean): void {
+    // No-op: Processing state no longer affects frontend audio handling
   }
   
   /**
-   * Set greeting state from UI
-   * This prevents interrupts during the initial greeting
+   * Set greeting state from UI (deprecated in Vocalis 2.0)
    */
-  public setGreetingState(isGreeting: boolean): void {
-    this.isGreeting = isGreeting;
-    console.log(`Greeting state set to: ${isGreeting}`);
+  public setGreetingState(_isGreeting: boolean): void {
+    // No-op: Greeting state no longer affects frontend audio handling
   }
   
   /**
-   * Set vision processing state from UI
-   * This prevents interrupts during vision processing
+   * Set vision processing state from UI (deprecated in Vocalis 2.0)
    */
-  public setVisionProcessingState(isVisionProcessing: boolean): void {
-    this.isVisionProcessing = isVisionProcessing;
-    console.log(`Vision processing state set to: ${isVisionProcessing}`);
+  public setVisionProcessingState(_isVisionProcessing: boolean): void {
+    // No-op: Vision processing state no longer affects frontend audio handling
   }
   
 
@@ -199,23 +181,13 @@ export class AudioService {
         // Handle audio processing
         this.scriptProcessor.onaudioprocess = this.handleAudioProcess.bind(this);
         
-        // Clear previous buffer
-        this.audioBuffer = [];
-        
         // Set state
         this.audioState = AudioState.RECORDING;
-        
-        // Reset voice detection state
-        this.isVoiceDetected = false;
-        this.lastVoiceTime = 0;
-        
-        // Log voice detection threshold
-        console.log(`Voice detection enabled with threshold: ${this.voiceThreshold}`);
         
         // Dispatch event
         this.dispatchEvent(AudioEvent.RECORDING_START, {});
         
-        console.log('Recording started');
+        console.log('Recording started - streaming all audio to sherpa-asr');
       }
     } catch (error) {
       console.error('Error starting recording:', error);
@@ -231,12 +203,6 @@ export class AudioService {
   public stopRecording(): void {
     if (this.audioState !== AudioState.RECORDING) {
       return;
-    }
-
-    // Stop sending chunks
-    if (this.recordingIntervalId !== null) {
-      clearInterval(this.recordingIntervalId);
-      this.recordingIntervalId = null;
     }
 
     // Stop and clean up recorder
@@ -255,12 +221,8 @@ export class AudioService {
       this.mediaStream = null;
     }
 
-    // Send any remaining audio data
-    this.sendAudioChunk();
-
     // Reset state
     this.audioState = AudioState.INACTIVE;
-    this.audioBuffer = [];
 
     // Dispatch event
     this.dispatchEvent(AudioEvent.RECORDING_STOP, {});
@@ -269,109 +231,29 @@ export class AudioService {
   }
 
   /**
-   * Calculate RMS (Root Mean Square) energy of an audio buffer
-   */
-  private calculateRMSEnergy(buffer: Float32Array): number {
-    let sum = 0;
-    for (let i = 0; i < buffer.length; i++) {
-      sum += buffer[i] * buffer[i]; // Square each sample
-    }
-    const rms = Math.sqrt(sum / buffer.length); // RMS = square root of average
-    return rms;
-  }
-
-  /**
-   * Handle audio processing
+   * Handle audio processing - streams all audio to backend (including silence)
+   * Sherpa-asr handles its own VAD and end-of-turn detection
    */
   private handleAudioProcess(event: AudioProcessingEvent): void {
-    const inputBuffer = event.inputBuffer;
-    const inputData = inputBuffer.getChannelData(0);
-    
-    // Create a copy of the buffer
-    const bufferCopy = new Float32Array(inputData.length);
-    bufferCopy.set(inputData);
-    
-    // Calculate RMS energy
-    const energy = this.calculateRMSEnergy(bufferCopy);
-    
-    // Check if energy is above threshold (voice detected)
-    if (energy > this.voiceThreshold) {
-      // Check if in a protected state - if so, ignore voice detection entirely
-      if (this.isProcessing || this.isVisionProcessing || this.isGreeting) {
-        let state = "processing";
-        if (this.isVisionProcessing) state = "vision_processing";
-        if (this.isGreeting) state = "greeting";
-        
-        console.log(`Voice detected during ${state} (energy: ${energy.toFixed(4)}), ignoring`);
-        // Skip further processing - don't even update isVoiceDetected
-        
-        // Still dispatch event for visualization, but mark isVoice as false
-        this.dispatchEvent(AudioEvent.RECORDING_DATA, { 
-          buffer: bufferCopy,
-          energy: energy,
-          isVoice: false // Force false during processing or greeting
-        });
-        
-        return;
-      }
-      
-      if (!this.isVoiceDetected) {
-        console.log('Voice detected, energy:', energy);
-        this.isVoiceDetected = true;
-        
-      // Check if we're currently playing TTS audio
-      // If so, interrupt it immediately - BUT NOT during greeting
-      // Also explicitly check audioState to catch any edge cases
-      if ((this.isSpeaking || this.audioState === AudioState.SPEAKING) && !this.isGreeting) {
-        console.log('User started speaking while assistant was speaking - interrupting playback',
-                   `isSpeaking=${this.isSpeaking}, audioState=${this.audioState}, isGreeting=${this.isGreeting}`);
-        // Stop playback locally
-        this.stopPlayback();
-        // Send interrupt signal to server
-        websocketService.interrupt();
-        // Dispatch an event so UI can update
-        this.dispatchEvent(AudioEvent.PLAYBACK_STOP, {
-          interrupted: true,
-          reason: 'user_interrupt'
-        });
-      } else if (this.isGreeting) {
-        console.log('Voice detected during greeting - suppressing interrupt');
-      }
-      }
-      this.lastVoiceTime = Date.now();
+    const inputData = event.inputBuffer.getChannelData(0);
+    const bufferCopy = new Float32Array(inputData);
+
+    // Convert to WAV and send immediately
+    const wavBuffer = this.float32ToWav(bufferCopy, this.config.sampleRate);
+    websocketService.sendAudio(wavBuffer);
+
+    // Calculate energy for UI visualization
+    let sum = 0;
+    for (let i = 0; i < bufferCopy.length; i++) {
+      sum += bufferCopy[i] * bufferCopy[i];
     }
+    const energy = Math.sqrt(sum / bufferCopy.length);
     
-    // If in a protected state, never accumulate audio buffer
-    if (this.isProcessing || this.isVisionProcessing || this.isGreeting) {
-      // Dispatch event for visualization only
-      this.dispatchEvent(AudioEvent.RECORDING_DATA, { 
-        buffer: bufferCopy,
-        energy: energy,
-        isVoice: false // Force false during processing
-      });
-      return;
-    }
-    
-    // Add to buffer if voice is detected or we're in the silence timeout period
-    if (this.isVoiceDetected) {
-      this.audioBuffer.push(bufferCopy);
-      
-      // Check if we've exceeded silence timeout
-      const timeSinceVoice = Date.now() - this.lastVoiceTime;
-      if (energy <= this.voiceThreshold && timeSinceVoice > this.silenceTimeout) {
-        console.log('Voice ended, silence timeout exceeded');
-        this.isVoiceDetected = false;
-        
-        // Send accumulated audio
-        this.sendAudioChunk();
-      }
-    }
-    
-    // Dispatch event
+    // Dispatch event for visualization
     this.dispatchEvent(AudioEvent.RECORDING_DATA, { 
-      buffer: bufferCopy,
-      energy: energy,
-      isVoice: this.isVoiceDetected
+      buffer: bufferCopy, 
+      energy: energy, 
+      isVoice: true // Always true since sherpa-asr does its own VAD
     });
   }
 
@@ -434,54 +316,6 @@ export class AudioService {
   }
 
   /**
-   * Send accumulated audio chunk to WebSocket
-   */
-  private sendAudioChunk(): void {
-    if (this.audioBuffer.length === 0) {
-      return;
-    }
-    
-    // Don't send audio if we're in processing state
-    if (this.isProcessing) {
-      console.log('Processing state active, discarding audio chunk');
-      this.audioBuffer = [];
-      return;
-    }
-
-    // Calculate total length
-    const totalLength = this.audioBuffer.reduce((acc, buffer) => acc + buffer.length, 0);
-    
-    // Check if we have enough audio to send (avoid sending tiny fragments)
-    const audioLengthMs = (totalLength / this.config.sampleRate) * 1000;
-    if (!this.isVoiceDetected && audioLengthMs < this.minRecordingLength) {
-      console.log(`Audio too short (${audioLengthMs.toFixed(0)}ms), discarding`);
-      this.audioBuffer = [];
-      return;
-    }
-    
-    // Create combined buffer
-    const combinedBuffer = new Float32Array(totalLength);
-    
-    // Copy data
-    let offset = 0;
-    for (const buffer of this.audioBuffer) {
-      combinedBuffer.set(buffer, offset);
-      offset += buffer.length;
-    }
-    
-    console.log(`Sending audio chunk: ${audioLengthMs.toFixed(0)}ms`);
-    
-    // Convert to WAV format
-    const wavBuffer = this.float32ToWav(combinedBuffer, this.config.sampleRate);
-    
-    // Send to WebSocket
-    websocketService.sendAudio(wavBuffer);
-    
-    // Clear buffer
-    this.audioBuffer = [];
-  }
-
-  /**
    * Play audio from base64-encoded data
    * 
    * The backend now sends complete audio files instead of chunks,
@@ -490,7 +324,7 @@ export class AudioService {
    * This method is specifically for playing TTS content and will
    * set the state to SPEAKING rather than just PLAYING.
    */
-  public async playAudioChunk(base64AudioChunk: string, format: string = 'wav'): Promise<void> {
+  public async playAudioChunk(base64AudioChunk: string): Promise<void> {
     try {
       await this.initAudioContext();
       
@@ -728,8 +562,6 @@ export class AudioService {
     
     // Reset all state
     this.audioState = AudioState.INACTIVE;
-    this.isVoiceDetected = false;
-    this.audioBuffer = [];
     this.isPlaying = false;
     this.isSpeaking = false;
     

@@ -15,9 +15,7 @@ load_dotenv()
 # API Endpoints
 LLM_API_ENDPOINT = os.getenv("LLM_API_ENDPOINT", "http://127.0.0.1:1234/v1/chat/completions")
 TTS_API_ENDPOINT = os.getenv("TTS_API_ENDPOINT", "http://localhost:5005/v1/audio/speech")
-
-# Whisper Model Configuration
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "tiny.en")
+ASR_API_ENDPOINT = os.getenv("ASR_API_ENDPOINT", "ws://localhost:5002")
 
 # TTS Configuration
 TTS_MODEL = os.getenv("TTS_MODEL", "tts-1")
@@ -43,7 +41,7 @@ def get_config() -> Dict[str, Any]:
     return {
         "llm_api_endpoint": LLM_API_ENDPOINT,
         "tts_api_endpoint": TTS_API_ENDPOINT,
-        "whisper_model": WHISPER_MODEL,
+        "asr_api_endpoint": ASR_API_ENDPOINT,
         "tts_model": TTS_MODEL,
         "tts_voice": TTS_VOICE,
         "tts_format": TTS_FORMAT,

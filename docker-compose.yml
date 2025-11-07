@@ -11,8 +11,8 @@ services:
       # TTS endpoint (Kokoro TTS service)
       TTS_API_ENDPOINT: http://tts-server:8880/v1/audio/speech
       TTS_VOICE: af_sky
-      # Whisper model for ASR (runs locally in the container)
-      WHISPER_MODEL: tiny.en
+      # ASR endpoint (sherpa-onnx WebSocket server)
+      ASR_API_ENDPOINT: ws://sherpa-asr:5002
       # Server config
       WEBSOCKET_HOST: 0.0.0.0
       WEBSOCKET_PORT: 8000
@@ -23,6 +23,7 @@ services:
     depends_on:
       - llm-server
       - tts-server
+      - sherpa-asr
     ports:
       - "8000:8000"
     # Optional: mount for model cache if needed
@@ -80,6 +81,37 @@ services:
       - /mnt/LLM/cache:/root/.cache
     ports:
       - "8880:8880"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: ["gpu"]
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    networks:
+      - vocalis-net
+    restart: unless-stopped
+
+  # === ASR: sherpa-onnx WebSocket server (GPU) ===
+  sherpa-asr:
+    build:
+      context: .
+      dockerfile: docker/sherpa-asr.Dockerfile
+    container_name: sherpa-asr
+    command: >
+      sherpa-onnx-online-websocket-server
+      --port=5002
+      --encoder=/models/sherpa-onnx-streaming-zipformer-en-2023-06-26/encoder-epoch-99-avg-1-chunk-16-left-128.onnx
+      --decoder=/models/sherpa-onnx-streaming-zipformer-en-2023-06-26/decoder-epoch-99-avg-1-chunk-16-left-128.onnx
+      --joiner=/models/sherpa-onnx-streaming-zipformer-en-2023-06-26/joiner-epoch-99-avg-1-chunk-16-left-128.onnx
+      --tokens=/models/sherpa-onnx-streaming-zipformer-en-2023-06-26/tokens.txt
+      --decoding-method=greedy_search
+      --max-active-paths=4
+    volumes:
+      - /mnt/LLM/asr/models:/models:ro
+    ports:
+      - "5002:5002"
     deploy:
       resources:
         reservations:

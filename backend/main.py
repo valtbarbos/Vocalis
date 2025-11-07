@@ -14,7 +14,6 @@ from contextlib import asynccontextmanager
 from . import config
 
 # Import services
-from .services.transcription import WhisperTranscriber
 from .services.llm import LLMClient
 from .services.tts import TTSClient
 from .services.vision import vision_service
@@ -30,7 +29,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Global service instances
-transcription_service = None
 llm_service = None
 tts_service = None
 # Vision service is a singleton already initialized in its module
@@ -46,13 +44,7 @@ async def lifespan(app: FastAPI):
     # Initialize services on startup
     logger.info("Initializing services...")
     
-    global transcription_service, llm_service, tts_service
-    
-    # Initialize transcription service
-    transcription_service = WhisperTranscriber(
-        model_size=cfg["whisper_model"],
-        sample_rate=cfg["audio_sample_rate"]
-    )
+    global llm_service, tts_service
     
     # Initialize LLM service
     llm_service = LLMClient(
@@ -101,9 +93,6 @@ app.add_middleware(
 )
 
 # Service dependency functions
-def get_transcription_service():
-    return transcription_service
-
 def get_llm_service():
     return llm_service
 
@@ -122,13 +111,11 @@ async def health_check():
     return {
         "status": "ok",
         "services": {
-            "transcription": transcription_service is not None,
             "llm": llm_service is not None,
             "tts": tts_service is not None,
             "vision": vision_service.is_ready()
         },
         "config": {
-            "whisper_model": config.WHISPER_MODEL,
             "tts_voice": config.TTS_VOICE,
             "websocket_port": config.WEBSOCKET_PORT
         }
@@ -137,11 +124,10 @@ async def health_check():
 @app.get("/config")
 async def get_full_config():
     """Get full configuration."""
-    if not all([transcription_service, llm_service, tts_service]) or not vision_service.is_ready():
+    if not all([llm_service, tts_service]) or not vision_service.is_ready():
         raise HTTPException(status_code=503, detail="Services not initialized")
     
     return {
-        "transcription": transcription_service.get_config(),
         "llm": llm_service.get_config(),
         "tts": tts_service.get_config(),
         "system": config.get_config()
@@ -153,7 +139,6 @@ async def websocket_route(websocket: WebSocket):
     """WebSocket endpoint for bidirectional audio streaming."""
     await websocket_endpoint(
         websocket, 
-        transcription_service, 
         llm_service, 
         tts_service
     )

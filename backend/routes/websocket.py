@@ -10,12 +10,14 @@ import asyncio
 import numpy as np
 import base64
 import os
+import aiohttp
+import time
 from typing import Dict, Any, List, Optional, AsyncGenerator
 from fastapi import WebSocket, WebSocketDisconnect, BackgroundTasks
 from pydantic import BaseModel
 from datetime import datetime
 
-from ..services.transcription import WhisperTranscriber
+from .. import config
 from ..services.llm import LLMClient
 from ..services.tts import TTSClient
 from ..services.conversation_storage import ConversationStorage
@@ -66,7 +68,6 @@ class WebSocketManager:
     
     def __init__(
         self,
-        transcriber: WhisperTranscriber,
         llm_client: LLMClient,
         tts_client: TTSClient
     ):
@@ -74,19 +75,21 @@ class WebSocketManager:
         Initialize the WebSocket manager.
         
         Args:
-            transcriber: Whisper transcription service
             llm_client: LLM client service
             tts_client: TTS client service
         """
-        self.transcriber = transcriber
         self.llm_client = llm_client
         self.tts_client = tts_client
+        self.asr_api_endpoint = config.get_config()["asr_api_endpoint"]
+        
+        # New state for ASR connection
+        self.asr_session: aiohttp.ClientSession | None = None
+        self.asr_websocket: aiohttp.ClientWebSocketResponse | None = None
+        self.asr_listener_task: asyncio.Task | None = None
         
         # State tracking
         self.active_connections: List[WebSocket] = []
         self.is_processing = False
-        self.speech_buffer = []
-        self.current_audio_task = None
         self.interrupt_playback = asyncio.Event()
         self.current_vision_context = None  # Store the latest vision context
         
@@ -157,9 +160,24 @@ class WebSocketManager:
         await websocket.accept()
         self.active_connections.append(websocket)
         
+        # Connect to ASR service
+        try:
+            self.asr_session = aiohttp.ClientSession()
+            self.asr_websocket = await self.asr_session.ws_connect(self.asr_api_endpoint)
+            
+            # Don't send any configuration - let sherpa use defaults
+            logger.info("Connected to ASR service")
+            
+            # Start the background task to listen to sherpa-asr
+            self.asr_listener_task = asyncio.create_task(
+                self._listen_to_asr(websocket)
+            )
+        except Exception as e:
+            logger.error(f"Failed to connect to ASR service: {e}")
+            await self._send_error(websocket, "Failed to connect to ASR service.")
+        
         # Send initial status
         await self._send_status(websocket, "connected", {
-            "transcription_active": self.transcriber.is_processing,
             "llm_active": self.llm_client.is_processing,
             "tts_active": self.tts_client.is_processing
         })
@@ -173,6 +191,18 @@ class WebSocketManager:
         Args:
             websocket: The WebSocket connection
         """
+        # Clean up ASR connection
+        try:
+            if self.asr_listener_task:
+                self.asr_listener_task.cancel()
+            if self.asr_websocket:
+                asyncio.create_task(self.asr_websocket.close())
+            if self.asr_session:
+                asyncio.create_task(self.asr_session.close())
+            logger.info("ASR connection closed.")
+        except Exception as e:
+            logger.error(f"Error disconnecting from ASR: {e}")
+        
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
         logger.info(f"Client disconnected. Active connections: {len(self.active_connections)}")
@@ -211,109 +241,90 @@ class WebSocketManager:
     
     async def handle_audio(self, websocket: WebSocket, audio_data: bytes):
         """
-        Process incoming audio data from a WebSocket client.
+        Process incoming audio data by forwarding it to the ASR service.
         
         Args:
             websocket: The WebSocket connection
-            audio_data: Raw audio data
+            audio_data: Raw audio data (WAV format with header)
         """
-        try:
-            # We're receiving WAV data, so we need to parse the WAV header
-            # WAV format: 44-byte header followed by PCM data
-            # Let whisper handle the WAV data directly - it can parse WAV headers
-            audio_array = np.frombuffer(audio_data, dtype=np.uint8)
-            
-            # Interrupt any ongoing TTS playback
-            if self.tts_client.is_processing:
-                logger.info("Interrupting TTS playback due to new speech")
-                self.interrupt_playback.set()
-                
-                # Let any current processing finish before starting new
-                if self.current_audio_task and not self.current_audio_task.done():
-                    try:
-                        await self.current_audio_task
-                    except asyncio.CancelledError:
-                        logger.info("Previous audio task cancelled")
-            
-            # Process the audio segment in a background task
-            # Whisper will handle voice activity detection internally
-            self.current_audio_task = asyncio.create_task(
-                self._process_speech_segment(websocket, audio_array)
-            )
-            
-            # Send processing status update
-            await self._send_status(websocket, "audio_processing", {
-                "transcription_active": self.transcriber.is_processing
-            })
-                
-        except Exception as e:
-            logger.error(f"Error processing audio: {e}")
-            await self._send_error(websocket, f"Audio processing error: {str(e)}")
+        if self.asr_websocket and not self.asr_websocket.closed:
+            try:
+                # Send the full WAV file (header + data) as binary frame
+                await self.asr_websocket.send_bytes(audio_data)
+                logger.debug(f"Forwarded {len(audio_data)} bytes WAV to ASR")
+            except Exception as e:
+                logger.error(f"Error forwarding audio to ASR: {e}", exc_info=True)
+        else:
+            logger.warning("ASR connection not ready. Audio data discarded.")
     
-    async def _process_speech_segment(self, websocket: WebSocket, speech_audio: np.ndarray):
+    async def _listen_to_asr(self, client_ws: WebSocket):
         """
-        Process a complete speech segment.
+        Listens for transcription results from the sherpa-asr service.
+        
+        Args:
+            client_ws: The client WebSocket connection
+        """
+        try:
+            logger.info("Started listening to ASR messages")
+            async for msg in self.asr_websocket:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(msg.data)
+                    text = data.get("text", "")
+                    is_final = data.get("is_final", False)
+
+                    # Log all responses for debugging
+                    logger.debug(f"ASR response: text='{text}', is_final={is_final}")
+
+                    if not text.strip():
+                        continue  # Ignore empty messages
+
+                    if is_final:
+                        logger.info(f"ASR Final: {text}")
+                        # Send final transcription to UI
+                        await client_ws.send_json({
+                            "type": MessageType.TRANSCRIPTION,
+                            "text": text,
+                            "metadata": {"is_partial": False}
+                        })
+                        # Trigger LLM/TTS processing
+                        await self._process_final_text(client_ws, text, {})
+                    else:
+                        # Send partial transcription to UI
+                        await client_ws.send_json({
+                            "type": MessageType.TRANSCRIPTION,
+                            "text": text,
+                            "metadata": {"is_partial": True}
+                        })
+        except Exception as e:
+            if not isinstance(e, asyncio.CancelledError):
+                logger.error(f"ASR listener error: {e}", exc_info=True)
+                await self._send_error(client_ws, "ASR service connection error.")
+            else:
+                logger.info("ASR listener task cancelled")
+    
+    async def _process_final_text(self, websocket: WebSocket, transcript: str, metadata: Dict[str, Any]):
+        """
+        Process the final transcribed text through LLM and TTS.
         
         Args:
             websocket: The WebSocket connection
-            speech_audio: Speech audio as numpy array
+            transcript: The transcribed text
+            metadata: Additional metadata
         """
         try:
-            # Set processing flag
             self.is_processing = True
             self.interrupt_playback.clear()
             
-            # Transcribe speech
-            await self._send_status(websocket, "transcribing", {})
-            transcript, metadata = self.transcriber.transcribe(speech_audio)
-            
-            # Send transcription result
-            await websocket.send_json({
-                "type": MessageType.TRANSCRIPTION,
-                "text": transcript,
-                "metadata": metadata,
-                "timestamp": datetime.now().isoformat()
-            })
-            
-            # Skip LLM and TTS if transcription is empty
-            if not transcript.strip():
-                logger.info("Empty transcription, skipping LLM and TTS")
-                
-                # Notify frontend that transcription occurred (even if it's just "...") to let it reset
-                await websocket.send_json({
-                    "type": MessageType.TRANSCRIPTION,
-                    "text": transcript,
-                    "metadata": {},
-                    "timestamp": datetime.now().isoformat()
-                })
-
-                # Still send TTS_END to fully reset UI
-                await websocket.send_json({
-                    "type": MessageType.TTS_END,
-                    "timestamp": datetime.now().isoformat()
-                })
-                return
-                
-            # Check if we have recent vision context to incorporate
+            # Check if we have recent vision context
             has_vision_context = self.current_vision_context is not None
             
             if has_vision_context:
                 logger.info("Processing speech with vision context")
-                
-                # Add vision context to conversation history
                 self._add_vision_context_to_conversation(self.current_vision_context)
-                
-                # Enhance user query with vision context reference
                 enhanced_transcript = f"{transcript} [Note: This question refers to the image I just analyzed.]"
-                
-                # Get LLM response with vision-aware context
                 await self._send_status(websocket, "processing_llm", {"has_vision_context": True})
                 llm_response = self.llm_client.get_response(enhanced_transcript, self.system_prompt)
-                
-                # Clear vision context after use to avoid affecting future non-vision conversations
-                # Only clear after successful processing
                 self.current_vision_context = None
-                logger.info("Vision context processed and cleared")
             else:
                 # Normal non-vision processing
                 await self._send_status(websocket, "processing_llm", {})
@@ -331,8 +342,8 @@ class WebSocketManager:
             await self._send_tts_response(websocket, llm_response["text"])
             
         except Exception as e:
-            logger.error(f"Error processing speech segment: {e}")
-            await self._send_error(websocket, f"Speech processing error: {str(e)}")
+            logger.error(f"Error processing final text: {e}")
+            await self._send_error(websocket, f"Text processing error: {str(e)}")
         finally:
             self.is_processing = False
     
@@ -782,13 +793,18 @@ class WebSocketManager:
         """
         try:
             message_type = message.get("type", "")
+            logger.debug(f"Handling message type: {message_type}")
             
             if message_type == MessageType.AUDIO:
+                logger.info("Received AUDIO message")
                 # Handle audio data
                 audio_base64 = message.get("audio_data", "")
                 if audio_base64:
                     audio_bytes = base64.b64decode(audio_base64)
+                    logger.info(f"Decoded {len(audio_bytes)} bytes from base64")
                     await self.handle_audio(websocket, audio_bytes)
+                else:
+                    logger.warning("Received AUDIO message with no audio_data")
                     
             elif message_type == MessageType.VISION_FILE_UPLOAD:
                 # Handle vision image upload
@@ -1187,7 +1203,6 @@ class WebSocketManager:
 
 async def websocket_endpoint(
     websocket: WebSocket,
-    transcriber: WhisperTranscriber,
     llm_client: LLMClient,
     tts_client: TTSClient
 ):
@@ -1196,12 +1211,11 @@ async def websocket_endpoint(
     
     Args:
         websocket: The WebSocket connection
-        transcriber: Whisper transcription service
         llm_client: LLM client service
         tts_client: TTS client service
     """
     # Create WebSocket manager
-    manager = WebSocketManager(transcriber, llm_client, tts_client)
+    manager = WebSocketManager(llm_client, tts_client)
     
     try:
         # Accept connection
