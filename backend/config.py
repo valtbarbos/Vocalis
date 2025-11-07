@@ -33,6 +33,12 @@ VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", 0.5))
 VAD_BUFFER_SIZE = int(os.getenv("VAD_BUFFER_SIZE", 30))
 AUDIO_SAMPLE_RATE = int(os.getenv("AUDIO_SAMPLE_RATE", 48000))
 
+# EOT Configuration
+EOT_API_ENDPOINT = os.getenv("EOT_API_ENDPOINT", "http://eot-server:8500/predict")
+EOT_ENABLED = os.getenv("EOT_ENABLED", "false").lower() in ("true", "1")
+EOT_THRESHOLD = float(os.getenv("EOT_THRESHOLD", 0.5))
+EOT_FORCE_AFTER = float(os.getenv("EOT_FORCE_AFTER", 2.0))
+
 def get_config() -> Dict[str, Any]:
     """
     Returns all configuration settings as a dictionary.
@@ -52,4 +58,8 @@ def get_config() -> Dict[str, Any]:
         "vad_threshold": VAD_THRESHOLD,
         "vad_buffer_size": VAD_BUFFER_SIZE,
         "audio_sample_rate": AUDIO_SAMPLE_RATE,
+        "eot_api_endpoint": EOT_API_ENDPOINT,
+        "eot_enabled": EOT_ENABLED,
+        "eot_threshold": EOT_THRESHOLD,
+        "eot_force_after": EOT_FORCE_AFTER,
     }

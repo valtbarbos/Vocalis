@@ -20,9 +20,15 @@ services:
       VAD_THRESHOLD: "0.5"
       VAD_BUFFER_SIZE: "30"
       AUDIO_SAMPLE_RATE: "48000"
+      # EOT endpoint (End-of-Turn detection service)
+      EOT_API_ENDPOINT: http://eot-server:8500/predict
+      EOT_ENABLED: "true"
+      EOT_THRESHOLD: "0.5"
+      EOT_FORCE_AFTER: "2.0"
     depends_on:
       - llm-server
       - tts-server
+      - eot-server
     ports:
       - "8000:8000"
     # Optional: mount for model cache if needed
@@ -88,6 +94,22 @@ services:
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
+    networks:
+      - vocalis-net
+    restart: unless-stopped
+
+  # === EOT: Semantic End-of-Turn Detection (CPU) ===
+  eot-server:
+    build:
+      context: ./eot-server
+      dockerfile: Dockerfile
+    container_name: eot-server
+    environment:
+      - EOT_THRESHOLD=0.5
+      - HOST=0.0.0.0
+      - PORT=8500
+    ports:
+      - "8500:8500"
     networks:
       - vocalis-net
     restart: unless-stopped

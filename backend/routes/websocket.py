@@ -10,6 +10,7 @@ import asyncio
 import numpy as np
 import base64
 import os
+import time
 from typing import Dict, Any, List, Optional, AsyncGenerator
 from fastapi import WebSocket, WebSocketDisconnect, BackgroundTasks
 from pydantic import BaseModel
@@ -19,6 +20,8 @@ from ..services.transcription import WhisperTranscriber
 from ..services.llm import LLMClient
 from ..services.tts import TTSClient
 from ..services.conversation_storage import ConversationStorage
+from ..services.eot import EOTClient
+from .. import config
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -68,7 +71,8 @@ class WebSocketManager:
         self,
         transcriber: WhisperTranscriber,
         llm_client: LLMClient,
-        tts_client: TTSClient
+        tts_client: TTSClient,
+        eot_client: EOTClient = None
     ):
         """
         Initialize the WebSocket manager.
@@ -77,10 +81,12 @@ class WebSocketManager:
             transcriber: Whisper transcription service
             llm_client: LLM client service
             tts_client: TTS client service
+            eot_client: End-of-Turn detection client (optional)
         """
         self.transcriber = transcriber
         self.llm_client = llm_client
         self.tts_client = tts_client
+        self.eot_client = eot_client
         
         # State tracking
         self.active_connections: List[WebSocket] = []
@@ -89,6 +95,11 @@ class WebSocketManager:
         self.current_audio_task = None
         self.interrupt_playback = asyncio.Event()
         self.current_vision_context = None  # Store the latest vision context
+        
+        # EOT buffering state
+        self.partial_turn_buffer: str = ""
+        self.last_partial_timestamp: float = 0.0
+        self.eot_force_after_sec: float = config.EOT_FORCE_AFTER
         
         # File paths
         self.prompt_path = os.path.join("prompts", "system_prompt.md")
@@ -236,9 +247,9 @@ class WebSocketManager:
                         logger.info("Previous audio task cancelled")
             
             # Process the audio segment in a background task
-            # Whisper will handle voice activity detection internally
+            # Pass both audio bytes (for EOT) and array (for transcription)
             self.current_audio_task = asyncio.create_task(
-                self._process_speech_segment(websocket, audio_array)
+                self._process_speech_segment(websocket, audio_array, audio_data)
             )
             
             # Send processing status update
@@ -250,43 +261,109 @@ class WebSocketManager:
             logger.error(f"Error processing audio: {e}")
             await self._send_error(websocket, f"Audio processing error: {str(e)}")
     
-    async def _process_speech_segment(self, websocket: WebSocket, speech_audio: np.ndarray):
+    async def _process_speech_segment(self, websocket: WebSocket, speech_audio_array: np.ndarray, speech_audio_bytes: bytes):
         """
-        Process a complete speech segment.
+        Process an audio segment, check EOT, and decide whether to buffer or process the final turn.
         
         Args:
             websocket: The WebSocket connection
-            speech_audio: Speech audio as numpy array
+            speech_audio_array: Speech audio as numpy array (for transcription)
+            speech_audio_bytes: Speech audio as raw bytes (for EOT detection)
         """
         try:
-            # Set processing flag
             self.is_processing = True
             self.interrupt_playback.clear()
+
+            # 1. Check for EOT timeout BEFORE processing
+            now = time.monotonic()
+            if self.partial_turn_buffer and (now - self.last_partial_timestamp) > self.eot_force_after_sec:
+                logger.info(f"Forcing EOT due to timeout on buffered text: '{self.partial_turn_buffer[:50]}...'")
+                final_text = self.partial_turn_buffer.strip()
+                self.partial_turn_buffer = ""
+                self.last_partial_timestamp = 0.0
+                # Call the refactored text processing function
+                await self._process_final_text(websocket, final_text, {"forced_eot": True, "reason": "timeout"})
+                return  # Stop processing this new audio chunk (it's too late)
+
+            # 2. Check EOT on the new audio chunk
+            eot_prob, is_eot = 1.0, True
+            if self.eot_client:
+                eot_prob, is_eot = await self.eot_client.is_eot(speech_audio_bytes)
             
-            # Transcribe speech
+            # 3. Transcribe the new audio chunk
             await self._send_status(websocket, "transcribing", {})
-            transcript, metadata = self.transcriber.transcribe(speech_audio)
+            transcript, metadata = self.transcriber.transcribe(speech_audio_array)
+            metadata["eot_prob"] = eot_prob
             
-            # Send transcription result
-            await websocket.send_json({
-                "type": MessageType.TRANSCRIPTION,
-                "text": transcript,
-                "metadata": metadata,
-                "timestamp": datetime.now().isoformat()
-            })
-            
-            # Skip LLM and TTS if transcription is empty
             if not transcript.strip():
-                logger.info("Empty transcription, skipping LLM and TTS")
-                
-                # Notify frontend that transcription occurred (even if it's just "...") to let it reset
+                logger.info("Empty transcription, skipping.")
                 await websocket.send_json({
                     "type": MessageType.TRANSCRIPTION,
-                    "text": transcript,
+                    "text": "",
                     "metadata": {},
                     "timestamp": datetime.now().isoformat()
                 })
+                await websocket.send_json({
+                    "type": MessageType.TTS_END,
+                    "timestamp": datetime.now().isoformat()
+                })
+                return
 
+            # 4. The core buffering logic
+            candidate_text = (self.partial_turn_buffer + " " + transcript).strip()
+
+            if not is_eot:
+                # EOT model said NO. Buffer and wait.
+                self.partial_turn_buffer = candidate_text
+                self.last_partial_timestamp = time.monotonic()
+                logger.info(f"Turn incomplete (prob={eot_prob:.3f}), buffering: '{candidate_text[:50]}...'")
+                
+                await websocket.send_json({
+                    "type": MessageType.TRANSCRIPTION,
+                    "text": candidate_text,
+                    "metadata": {**metadata, "is_partial": True},
+                    "timestamp": datetime.now().isoformat()
+                })
+                # DO NOT CALL LLM
+            
+            else:
+                # EOT model said YES. Process the full text.
+                logger.info(f"Turn complete (prob={eot_prob:.3f}), proceeding to LLM.")
+                final_text = candidate_text
+                self.partial_turn_buffer = ""  # Clear buffer
+                self.last_partial_timestamp = 0.0
+                
+                # Send final transcription to UI
+                await websocket.send_json({
+                    "type": MessageType.TRANSCRIPTION,
+                    "text": final_text,
+                    "metadata": {**metadata, "is_partial": False},
+                    "timestamp": datetime.now().isoformat()
+                })
+                
+                # Call the refactored text processing function
+                await self._process_final_text(websocket, final_text, metadata)
+
+        except Exception as e:
+            logger.error(f"Error processing speech segment: {e}")
+            await self._send_error(websocket, f"Speech processing error: {str(e)}")
+        finally:
+            self.is_processing = False
+    
+    async def _process_final_text(self, websocket: WebSocket, final_text: str, metadata: Dict[str, Any]):
+        """
+        Process the final text after EOT is confirmed.
+        
+        Args:
+            websocket: The WebSocket connection
+            final_text: The complete user text
+            metadata: Metadata from transcription/EOT
+        """
+        try:
+            # Skip LLM and TTS if text is empty
+            if not final_text.strip():
+                logger.info("Empty final text, skipping LLM and TTS")
+                
                 # Still send TTS_END to fully reset UI
                 await websocket.send_json({
                     "type": MessageType.TTS_END,
@@ -304,11 +381,11 @@ class WebSocketManager:
                 self._add_vision_context_to_conversation(self.current_vision_context)
                 
                 # Enhance user query with vision context reference
-                enhanced_transcript = f"{transcript} [Note: This question refers to the image I just analyzed.]"
+                enhanced_text = f"{final_text} [Note: This question refers to the image I just analyzed.]"
                 
                 # Get LLM response with vision-aware context
                 await self._send_status(websocket, "processing_llm", {"has_vision_context": True})
-                llm_response = self.llm_client.get_response(enhanced_transcript, self.system_prompt)
+                llm_response = self.llm_client.get_response(enhanced_text, self.system_prompt)
                 
                 # Clear vision context after use to avoid affecting future non-vision conversations
                 # Only clear after successful processing
@@ -317,7 +394,7 @@ class WebSocketManager:
             else:
                 # Normal non-vision processing
                 await self._send_status(websocket, "processing_llm", {})
-                llm_response = self.llm_client.get_response(transcript, self.system_prompt)
+                llm_response = self.llm_client.get_response(final_text, self.system_prompt)
             
             # Send LLM response
             await websocket.send_json({
@@ -331,10 +408,8 @@ class WebSocketManager:
             await self._send_tts_response(websocket, llm_response["text"])
             
         except Exception as e:
-            logger.error(f"Error processing speech segment: {e}")
-            await self._send_error(websocket, f"Speech processing error: {str(e)}")
-        finally:
-            self.is_processing = False
+            logger.error(f"Error processing final text: {e}")
+            await self._send_error(websocket, f"Text processing error: {str(e)}")
     
     async def _send_tts_response(self, websocket: WebSocket, text: str):
         """
@@ -1189,7 +1264,8 @@ async def websocket_endpoint(
     websocket: WebSocket,
     transcriber: WhisperTranscriber,
     llm_client: LLMClient,
-    tts_client: TTSClient
+    tts_client: TTSClient,
+    eot_client: EOTClient = None
 ):
     """
     FastAPI WebSocket endpoint.
@@ -1199,9 +1275,10 @@ async def websocket_endpoint(
         transcriber: Whisper transcription service
         llm_client: LLM client service
         tts_client: TTS client service
+        eot_client: End-of-Turn detection client (optional)
     """
     # Create WebSocket manager
-    manager = WebSocketManager(transcriber, llm_client, tts_client)
+    manager = WebSocketManager(transcriber, llm_client, tts_client, eot_client)
     
     try:
         # Accept connection
@@ -1210,21 +1287,33 @@ async def websocket_endpoint(
         # Handle messages
         while True:
             try:
-                # Receive message with a timeout
+                # Receive message with a shorter timeout for EOT force-flush
                 message = await asyncio.wait_for(
                     websocket.receive_json(),
-                    timeout=30.0  # 30 second timeout
+                    timeout=1.0  # 1 second timeout
                 )
                 
                 # Process message
                 await manager.handle_client_message(websocket, message)
                 
             except asyncio.TimeoutError:
-                # Send a ping to keep the connection alive
-                await websocket.send_json({
-                    "type": "ping",
-                    "timestamp": datetime.now().isoformat()
-                })
+                # Timeout occurred. Check if we need to force-flush the buffer.
+                if manager.partial_turn_buffer and \
+                   (time.monotonic() - manager.last_partial_timestamp) > manager.eot_force_after_sec:
+                    
+                    logger.info(f"WebSocket loop timeout: Forcing EOT on buffered text.")
+                    final_text = manager.partial_turn_buffer
+                    manager.partial_turn_buffer = ""
+                    manager.last_partial_timestamp = 0.0
+                    
+                    # Call the refactored text processing function
+                    await manager._process_final_text(websocket, final_text, {"forced_eot": True, "reason": "loop_timeout"})
+                else:
+                    # Just a normal keep-alive
+                    await websocket.send_json({
+                        "type": "ping",
+                        "timestamp": datetime.now().isoformat()
+                    })
                 
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected")

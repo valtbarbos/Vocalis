@@ -18,6 +18,7 @@ from .services.transcription import WhisperTranscriber
 from .services.llm import LLMClient
 from .services.tts import TTSClient
 from .services.vision import vision_service
+from .services.eot import EOTClient
 
 # Import routes
 from .routes.websocket import websocket_endpoint
@@ -33,6 +34,7 @@ logger = logging.getLogger(__name__)
 transcription_service = None
 llm_service = None
 tts_service = None
+eot_service = None
 # Vision service is a singleton already initialized in its module
 
 @asynccontextmanager
@@ -46,7 +48,7 @@ async def lifespan(app: FastAPI):
     # Initialize services on startup
     logger.info("Initializing services...")
     
-    global transcription_service, llm_service, tts_service
+    global transcription_service, llm_service, tts_service, eot_service
     
     # Initialize transcription service
     transcription_service = WhisperTranscriber(
@@ -66,6 +68,17 @@ async def lifespan(app: FastAPI):
         voice=cfg["tts_voice"],
         output_format=cfg["tts_format"]
     )
+    
+    # Initialize EOT service
+    if cfg.get("eot_enabled"):
+        eot_service = EOTClient(
+            api_endpoint=cfg["eot_api_endpoint"],
+            threshold=cfg["eot_threshold"],
+            enabled=cfg["eot_enabled"]
+        )
+        logger.info(f"EOT Service enabled, endpoint={cfg['eot_api_endpoint']}")
+    else:
+        logger.info("EOT Service disabled")
     
     # Initialize vision service (will download model if not cached)
     logger.info("Initializing vision service...")
@@ -109,6 +122,9 @@ def get_llm_service():
 
 def get_tts_service():
     return tts_service
+
+def get_eot_service():
+    return eot_service
 
 # API routes
 @app.get("/")
@@ -155,7 +171,8 @@ async def websocket_route(websocket: WebSocket):
         websocket, 
         transcription_service, 
         llm_service, 
-        tts_service
+        tts_service,
+        eot_service
     )
 
 # Run server directly if executed as script
